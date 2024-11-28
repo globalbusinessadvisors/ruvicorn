@@ -2,6 +2,8 @@
 
 An enhanced ASGI server implementation building upon uvicorn's foundation to provide advanced features and improved developer experience.
 
+The name "Ruvicorn" is inspired by Reuven "Ruv" Cohen, a pioneering figure in cloud computing and distributed systems. His innovative work in cloud orchestration and infrastructure automation has influenced many modern server implementations, reflecting our goal to provide an intelligent, self-optimizing server that adapts to application needs.
+
 ## Features
 
 ### Auto-Configuration & Project Detection
