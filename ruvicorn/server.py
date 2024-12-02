@@ -6,13 +6,14 @@ import asyncio
 import signal
 import logging
 import uvicorn
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, Callable, Awaitable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from .config import Config, AutoConfig
 from .logging import StructuredLogger, MetricsCollector
 from .hot_reload import HotReloader
+from .drain import ConnectionDrainer, DrainState
 from .middleware import (
     RateLimiter,
     CacheControl,
@@ -37,7 +38,11 @@ class RuvicornServer:
         self.metrics = self._setup_metrics() if self.config.metrics_enabled else None
         self.hot_reloader = self._setup_hot_reloader() if self.config.reload else None
         self.middleware_stack = self._setup_middleware()
-        self._active_connections: Set[str] = set()
+        self.connection_drainer = ConnectionDrainer(
+            drain_timeout=self.config.drain_timeout,
+            grace_period=self.config.grace_period,
+            logger=self.logger
+        )
         self._server_state = "stopped"
         self._reload_count = 0
         self._reload_stats = {
@@ -97,17 +102,11 @@ class RuvicornServer:
     async def _handle_reload(self, changes: Set[str]) -> None:
         """
         Handle code changes during development.
-        
-        This implements zero-downtime reloads by:
-        1. Detecting if changes require full or partial reload
-        2. Maintaining existing connections during reload
-        3. Gracefully transitioning to new code
         """
         self._reload_count += 1
         self._reload_stats["total_reloads"] += 1
         
         try:
-            # Determine reload type based on changed files
             requires_full_reload = any(
                 change.endswith((".py", ".pyd", ".so"))
                 for change in changes
@@ -130,11 +129,11 @@ class RuvicornServer:
         """
         self.logger.info("Performing full server reload")
         
+        # Start draining before reload
+        await self.connection_drainer.start_draining()
+        
         # Create new application instance
         new_app = await self._create_new_app_instance()
-        
-        # Gracefully shutdown old workers
-        await self._graceful_worker_shutdown()
         
         # Start new workers with new application
         await self._start_new_workers(new_app)
@@ -154,33 +153,6 @@ class RuvicornServer:
                 await self._reload_module(module_name)
         
         self.logger.info("Partial reload completed")
-    
-    async def _graceful_worker_shutdown(self) -> None:
-        """
-        Gracefully shutdown workers while maintaining existing connections.
-        """
-        # Wait for existing requests to complete
-        if self._active_connections:
-            self.logger.info(
-                f"Waiting for {len(self._active_connections)} "
-                "active connections to complete"
-            )
-            while self._active_connections:
-                await asyncio.sleep(0.1)
-    
-    async def _create_new_app_instance(self) -> Any:
-        """
-        Create a new instance of the application with updated code.
-        """
-        # Import the application module fresh
-        module_name, app_attr = self.config.app.split(":")
-        module = __import__(module_name, fromlist=[app_attr])
-        
-        # Reload the module to get updated code
-        import importlib
-        importlib.reload(module)
-        
-        return getattr(module, app_attr)
     
     async def _reload_module(self, module_name: str) -> None:
         """
@@ -236,13 +208,16 @@ class RuvicornServer:
     
     async def shutdown(self, sig: Optional[signal.Signals] = None) -> None:
         """
-        Gracefully shutdown the server.
+        Gracefully shutdown the server with connection draining.
         """
         if self._server_state == "stopped":
             return
             
         self._server_state = "shutting_down"
-        self.logger.info("Initiating graceful shutdown")
+        self.logger.info("Initiating graceful shutdown with connection draining")
+        
+        # Start connection draining
+        await self.connection_drainer.start_draining()
         
         # Stop hot reloader if running
         if self.hot_reloader:
@@ -252,15 +227,20 @@ class RuvicornServer:
         if self.metrics:
             await self.metrics.stop()
         
-        # Wait for active connections to complete
-        await self._graceful_worker_shutdown()
-        
         # Shutdown the server
         if hasattr(self, 'server'):
             self.server.should_exit = True
         
         self._server_state = "stopped"
-        self.logger.info("Server shutdown complete")
+        
+        # Log drain statistics
+        if self.connection_drainer.drain_duration is not None:
+            self.logger.info(
+                f"Server shutdown complete. Drain duration: "
+                f"{self.connection_drainer.drain_duration:.2f}s, "
+                f"Connections drained: {self.connection_drainer.stats.drained_connections}, "
+                f"Connections rejected: {self.connection_drainer.stats.rejected_connections}"
+            )
     
     async def _create_application(self) -> Any:
         """
@@ -278,21 +258,71 @@ class RuvicornServer:
         if "rate_limit" in self.middleware_stack:
             app = self.middleware_stack["rate_limit"].wrap(app)
         
-        return app
+        # Wrap the application with connection tracking
+        original_app = app
+        
+        async def connection_tracking_middleware(scope, receive, send):
+            if scope["type"] != "http":
+                return await original_app(scope, receive, send)
+                
+            conn_id = str(id(asyncio.current_task()))
+            
+            # Try to start tracking the connection
+            if not self.connection_drainer.start_connection(
+                conn_id,
+                scope.get("path", ""),
+                scope.get("method", ""),
+                f"{scope.get('client', ('unknown', 0))[0]}:{scope.get('client', ('', 0))[1]}"
+            ):
+                # Connection rejected during drain
+                response = {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"text/plain"),
+                        (b"retry-after", b"5"),
+                    ],
+                }
+                await send(response)
+                await send({"type": "http.response.body", "body": b"Server is shutting down"})
+                return
+                
+            try:
+                await original_app(scope, receive, send)
+            finally:
+                self.connection_drainer.end_connection(conn_id)
+        
+        return connection_tracking_middleware
+    
+    async def _create_new_app_instance(self) -> Any:
+        """
+        Create a new instance of the application with updated code.
+        """
+        # Import the application module fresh
+        module_name, app_attr = self.config.app.split(":")
+        module = __import__(module_name, fromlist=[app_attr])
+        
+        # Reload the module to get updated code
+        import importlib
+        importlib.reload(module)
+        
+        return getattr(module, app_attr)
+    
+    def add_cleanup_hook(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """
+        Add a cleanup hook to be called during shutdown.
+        """
+        self.connection_drainer.add_cleanup_hook(hook)
     
     @property
-    def reload_stats(self) -> Dict[str, Any]:
-        """Get statistics about server reloads."""
-        return self._reload_stats.copy()
-    
-    @asynccontextmanager
-    async def connection_tracking(self):
-        """
-        Context manager for tracking active connections.
-        """
-        conn_id = str(id(asyncio.current_task()))
-        self._active_connections.add(conn_id)
-        try:
-            yield
-        finally:
-            self._active_connections.discard(conn_id)
+    def drain_stats(self) -> Dict[str, Any]:
+        """Get current connection drain statistics."""
+        return {
+            "state": self.connection_drainer.state.value,
+            "active_connections": len(self.connection_drainer.active_connections),
+            "total_connections": self.connection_drainer.stats.total_connections,
+            "drained_connections": self.connection_drainer.stats.drained_connections,
+            "rejected_connections": self.connection_drainer.stats.rejected_connections,
+            "longest_connection": self.connection_drainer.stats.longest_connection,
+            "drain_duration": self.connection_drainer.drain_duration
+        }

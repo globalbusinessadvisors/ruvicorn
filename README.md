@@ -30,6 +30,11 @@ The name "Ruvicorn" is inspired by Reuven "Ruv" Cohen, a pioneering figure in cl
 - Advanced caching strategies
 - Comprehensive CORS handling
 - Security headers management
+- Streaming file upload handling with memory optimization
+  - Configurable file size limits and type validation
+  - Efficient large file processing with chunked streaming
+  - Automatic temporary file cleanup
+  - Memory usage controls for high-concurrency scenarios
 
 ## Getting Started
 
@@ -85,6 +90,16 @@ middleware:
   security:
     hsts: true
     xss_protection: true
+
+  file_upload:
+    max_file_size: 52428800  # 50MB
+    allowed_types: 
+      - image/jpeg
+      - image/png
+      - application/pdf
+    chunk_size: 65536  # 64KB chunks
+    max_memory_buffer: 524288  # 512KB memory buffer
+    cleanup_timeout: 3600  # 1 hour
 ```
 
 ## Development
@@ -131,12 +146,15 @@ ruvicorn/
 │       ├── auth.py
 │       ├── cache.py
 │       ├── cors.py
-│       └── rate_limit.py
+│       ├── rate_limit.py
+│       ├── security.py
+│       └── file_upload.py
 ├── tests/
 │   ├── test_auto_config.py
 │   ├── test_logging.py
 │   ├── test_hot_reload.py
-│   └── test_middleware.py
+│   ├── test_middleware.py
+│   └── test_file_upload.py
 ├── pyproject.toml
 └── README.md
 ```
